@@ -29,11 +29,6 @@ load_dotenv(Path(__file__).parent / ".env")
 # ---------- Config ----------
 JIRA_BASE_URL = os.environ["JIRA_BASE_URL"].rstrip("/")
 JIRA_AUTH = (os.environ["JIRA_EMAIL"], os.environ["JIRA_API_TOKEN"])
-GITHUB_API_BASE = os.environ.get(
-    "GITHUB_API_BASE", "https://git.i.mercedes-benz.com/api/v3"
-).rstrip("/")
-GITHUB_WEB_HOST = os.environ.get("GITHUB_WEB_HOST", "git.i.mercedes-benz.com")
-GH_TOKEN = os.environ["GH_TOKEN"]
 MODEL = os.environ.get("MODEL", "claude-sonnet-4-6")
 JQL = os.environ.get(
     "JQL",
@@ -43,15 +38,48 @@ REQUIRE_PR_LINK = os.environ.get("REQUIRE_PR_LINK", "false").lower() == "true"
 MARKER = "Test Strategy"
 MAX_DIFF_CHARS = 60_000
 MAX_OUTPUT_TOKENS = 4_000
-GH_VERIFY_TLS = os.environ.get("GH_VERIFY_TLS", "true").lower() == "true"
 
-GH_HEADERS = {
-    "Authorization": f"Bearer {GH_TOKEN}",
-    "Accept": "application/vnd.github+json",
-}
 
+# ---------- GitHub hosts (one or more) ----------
+# Each host is configured with a numbered set of env vars:
+#   GH_HOST_<n>       web hostname that appears in PR links (e.g. git.i.mercedes-benz.com)
+#   GH_API_<n>        REST API base for that host
+#                       Enterprise Server : https://<host>/api/v3
+#                       Enterprise Cloud  : https://api.<subdomain>.ghe.com   (ghe.com)
+#   GH_TOKEN_<n>      access token valid for that host
+#   GH_VERIFY_TLS_<n> "false" only if the host uses an untrusted corporate cert (default true)
+def _load_github_hosts() -> dict:
+    hosts = {}
+    for n in range(1, 21):  # support up to 20 hosts
+        host = os.environ.get(f"GH_HOST_{n}")
+        if not host:
+            continue
+        api = os.environ.get(f"GH_API_{n}")
+        token = os.environ.get(f"GH_TOKEN_{n}")
+        if not api or not token:
+            print(f"  ! GH_HOST_{n}={host} is missing GH_API_{n} or GH_TOKEN_{n}, skipping")
+            continue
+        hosts[host.lower()] = {
+            "api": api.rstrip("/"),
+            "headers": {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            "verify_tls": os.environ.get(f"GH_VERIFY_TLS_{n}", "true").lower() != "false",
+        }
+    return hosts
+
+
+GITHUB_HOSTS = _load_github_hosts()
+if not GITHUB_HOSTS:
+    sys.exit(
+        "No GitHub hosts configured. Set GH_HOST_1 / GH_API_1 / GH_TOKEN_1 "
+        "(and GH_HOST_2, ... for more) in your .env. See .env.example."
+    )
+
+_HOSTS_ALT = "|".join(re.escape(h) for h in GITHUB_HOSTS)
 PR_URL_PATTERN = re.compile(
-    rf"https://{re.escape(GITHUB_WEB_HOST)}/([\w.\-]+)/([\w.\-]+)/pull/(\d+)",
+    rf"https://({_HOSTS_ALT})/([\w.\-]+)/([\w.\-]+)/pull/(\d+)",
     re.IGNORECASE,
 )
 
@@ -117,35 +145,91 @@ def get_acceptance_criteria(issue_key: str) -> str:
     return "\n".join(parts)
 
 
-def post_comment(issue_key: str, body_text: str) -> None:
+def _inline_nodes(text: str) -> list[dict]:
+    """Turn a line of text into ADF text nodes, honouring **bold** markup."""
+    nodes = []
+    for i, part in enumerate(re.split(r"\*\*(.+?)\*\*", text)):
+        if not part:
+            continue
+        node = {"type": "text", "text": part}
+        if i % 2 == 1:  # captured group = bold
+            node["marks"] = [{"type": "strong"}]
+        nodes.append(node)
+    return nodes or [{"type": "text", "text": text or " "}]
+
+
+def md_to_adf(md_text: str) -> list[dict]:
+    """Convert a constrained Markdown subset to a list of ADF block nodes.
+
+    Supported: #/##/### headings, '- ' bullets, '1. ' numbered lists,
+    **bold** inline, and plain paragraphs. Blank lines separate blocks.
+    """
+    blocks: list[dict] = []
+    bullets: list[dict] = []
+    ordered: list[dict] = []
+
+    def flush():
+        nonlocal bullets, ordered
+        if bullets:
+            blocks.append({"type": "bulletList", "content": bullets})
+            bullets = []
+        if ordered:
+            blocks.append({"type": "orderedList", "attrs": {"order": 1}, "content": ordered})
+            ordered = []
+
+    def list_item(text):
+        return {"type": "listItem",
+                "content": [{"type": "paragraph", "content": _inline_nodes(text)}]}
+
+    for raw in md_text.splitlines():
+        line = raw.strip()
+        if not line:
+            flush()
+            continue
+        h = re.match(r"^(#{1,6})\s+(.*)$", line)
+        b = re.match(r"^[-*]\s+(.*)$", line)
+        o = re.match(r"^\d+[.)]\s+(.*)$", line)
+        if h:
+            flush()
+            blocks.append({"type": "heading",
+                           "attrs": {"level": min(len(h.group(1)), 6)},
+                           "content": _inline_nodes(h.group(2))})
+        elif b:
+            if ordered:
+                flush()
+            bullets.append(list_item(b.group(1)))
+        elif o:
+            if bullets:
+                flush()
+            ordered.append(list_item(o.group(1)))
+        else:
+            flush()
+            blocks.append({"type": "paragraph", "content": _inline_nodes(line)})
+    flush()
+    return blocks
+
+
+def post_comment(issue_key: str, content: list[dict]) -> None:
     url = f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/comment"
-    payload = {
-        "body": {
-            "type": "doc",
-            "version": 1,
-            "content": [
-                {"type": "paragraph", "content": [{"type": "text", "text": body_text}]}
-            ],
-        }
-    }
+    payload = {"body": {"type": "doc", "version": 1, "content": content}}
     resp = requests.post(url, json=payload, auth=JIRA_AUTH, timeout=30)
     resp.raise_for_status()
 
 
 # ---------- GitHub Enterprise helpers ----------
-def fetch_pr(owner: str, repo: str, number: int) -> dict | None:
-    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{number}"
-    resp = requests.get(url, headers=GH_HEADERS, timeout=30, verify=GH_VERIFY_TLS)
+def fetch_pr(cfg: dict, owner: str, repo: str, number: int) -> dict | None:
+    url = f"{cfg['api']}/repos/{owner}/{repo}/pulls/{number}"
+    resp = requests.get(url, headers=cfg["headers"], timeout=30, verify=cfg["verify_tls"])
     if not resp.ok:
         print(f"  ! Could not fetch PR {owner}/{repo}#{number} ({resp.status_code})")
         return None
     return resp.json()
 
 
-def fetch_pr_diff(owner: str, repo: str, number: int) -> str:
-    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{number}"
-    headers = {**GH_HEADERS, "Accept": "application/vnd.github.v3.diff"}
-    resp = requests.get(url, headers=headers, timeout=60, verify=GH_VERIFY_TLS)
+def fetch_pr_diff(cfg: dict, owner: str, repo: str, number: int) -> str:
+    url = f"{cfg['api']}/repos/{owner}/{repo}/pulls/{number}"
+    headers = {**cfg["headers"], "Accept": "application/vnd.github.v3.diff"}
+    resp = requests.get(url, headers=headers, timeout=60, verify=cfg["verify_tls"])
     resp.raise_for_status()
     diff = resp.text
     if len(diff) > MAX_DIFF_CHARS:
@@ -157,26 +241,51 @@ def fetch_pr_diff(owner: str, repo: str, number: int) -> str:
 SYSTEM_PROMPT = """You are a senior QA / test automation engineer. You write precise,
 practical test cases that another tester can execute directly.
 
-Given a Jira ticket (description + acceptance criteria) and the code diff of the
-linked pull request, produce a test plan with these sections:
+You are given a Jira ticket (description + acceptance criteria) and the code diff of
+the linked pull request. Produce a SHORT, high-signal test plan.
 
-1. SUMMARY OF CHANGE — 2-3 sentences on what changed and the risk areas, based on the diff.
-2. HAPPY PATH TEST CASES
-3. EDGE CASES & BOUNDARY CONDITIONS
-4. NEGATIVE / ERROR-HANDLING TESTS
-5. REGRESSION RISKS — existing functionality the diff could plausibly break, and what to re-test.
-6. AUTOMATION CANDIDATES — which of the above are worth automating, and at what level (unit/API/UI).
-
-Format every test case as:
-  TC-<n>: <title>
-  Preconditions: ...
-  Steps: ...
-  Expected result: ...
+BE SELECTIVE — this is the most important rule:
+- Include ONLY the most critical and relevant test cases. At most 3 per section,
+  and fewer if the change is small. A focused plan a tester will actually finish
+  beats an exhaustive one they abandon.
+- Prioritise high-risk, high-impact scenarios tied directly to what changed in the
+  diff. Skip trivial, obvious, or low-value checks.
+- Quality and relevance over coverage.
 
 Ground every test case in the actual diff and acceptance criteria — do not invent
 features that are not present. If the diff and the ticket contradict each other,
-flag it explicitly. Output plain text (no markdown syntax), since this will be
-posted as a Jira comment."""
+flag it explicitly.
+
+OUTPUT FORMAT — use this exact Markdown structure (it is rendered into a Jira
+comment, so the headings and bullets matter). Do NOT use tables or code blocks.
+Number test cases sequentially (TC-1, TC-2, ...) across the whole plan.
+
+## Summary of Change
+2-3 sentences on what changed and the main risk areas.
+
+## Happy Path
+### TC-1: <short title>
+- **Preconditions:** ...
+- **Steps:** 1) ... 2) ... 3) ...
+- **Expected:** ...
+
+## Edge Cases
+### TC-2: <short title>
+- **Preconditions:** ...
+- **Steps:** 1) ... 2) ...
+- **Expected:** ...
+
+## Negative / Error Handling
+### TC-3: <short title>
+- **Preconditions:** ...
+- **Steps:** 1) ... 2) ...
+- **Expected:** ...
+
+## Automation Candidates
+- **TC-<n>:** <why it is worth automating, and at what level — unit / API / UI>
+
+Keep each section to its few most important cases. Use **bold** for field labels
+exactly as shown above."""
 
 
 def generate_test_cases(issue_key, summary, issue_type, description, ac, pr, diff) -> str:
@@ -237,25 +346,32 @@ def process_ticket(issue: dict) -> None:
 
     pr, diff = None, None
     if pr_match:
-        owner, repo, number = pr_match.group(1), pr_match.group(2), int(pr_match.group(3))
-        print(f"  - {key}: found PR {owner}/{repo}#{number}, fetching diff...")
-        pr = fetch_pr(owner, repo, number)
+        host = pr_match.group(1).lower()
+        owner, repo, number = pr_match.group(2), pr_match.group(3), int(pr_match.group(4))
+        cfg = GITHUB_HOSTS[host]
+        print(f"  - {key}: found PR {host}/{owner}/{repo}#{number}, fetching diff...")
+        pr = fetch_pr(cfg, owner, repo, number)
         if pr:
-            diff = fetch_pr_diff(owner, repo, number)
+            diff = fetch_pr_diff(cfg, owner, repo, number)
 
     print(f"  - {key}: generating test cases...")
     ac = get_acceptance_criteria(key)
     test_cases = generate_test_cases(key, summary, issue_type, description, ac, pr, diff)
 
-    header = f"{MARKER}\n(AI-generated from the ticket"
     if pr:
-        header += f" and PR {pr.get('html_url', '')}"
-        header += " — review before use)\n"
+        note = f"AI-generated from the ticket and PR {pr.get('html_url', '')} — review before use."
     else:
-        header += " only — no PR link found at generation time; review before use)\n"
-    header += "-" * 40 + "\n\n"
+        note = "AI-generated from the ticket only — no PR link found at generation time; review before use."
 
-    post_comment(key, header + test_cases)
+    content = [
+        {"type": "heading", "attrs": {"level": 1},
+         "content": [{"type": "text", "text": MARKER}]},
+        {"type": "paragraph",
+         "content": [{"type": "text", "text": note, "marks": [{"type": "em"}]}]},
+        {"type": "rule"},
+        *md_to_adf(test_cases),
+    ]
+    post_comment(key, content)
     print(f"  ✓ {key}: test cases posted")
 
 
